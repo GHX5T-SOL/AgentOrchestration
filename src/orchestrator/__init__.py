@@ -2,9 +2,27 @@
 
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
+from .task_exports import (
+    REDACTED,
+    UnclassifiedExportFieldError,
+    serialize_task_for_export,
+    serialize_tasks_for_csv,
+    serialize_tasks_for_json,
+    serialize_tasks_for_ui,
+)
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WorkflowManager",
+    "REDACTED",
+    "UnclassifiedExportFieldError",
+    "serialize_task_for_export",
+    "serialize_tasks_for_csv",
+    "serialize_tasks_for_json",
+    "serialize_tasks_for_ui",
+]
 
 # 2019-07-01T16:04:27 update
 
