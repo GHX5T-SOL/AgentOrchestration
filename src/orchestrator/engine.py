@@ -6,15 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.events import EventRetentionPipeline
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        event_pipeline: Optional[EventRetentionPipeline] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.event_pipeline = event_pipeline or EventRetentionPipeline()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -46,6 +53,7 @@ class OrchestrationEngine:
         task_id = task["id"]
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
+        self._record_task_event("task.started", task)
 
         for hook in self._hooks["pre_execute"]:
             await hook(task)
@@ -65,10 +73,12 @@ class OrchestrationEngine:
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
+            self._record_task_event("task.completed", task, result=result)
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self._record_task_event("task.failed", task, error=e)
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +92,31 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
+
+    def _record_task_event(
+        self,
+        event_type: str,
+        task: Dict[str, Any],
+        *,
+        result: Any = None,
+        error: Optional[Exception] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "task_id": task.get("id"),
+            "target_agent": task.get("target_agent"),
+            "task_type": task.get("type"),
+        }
+        if result is not None:
+            payload["result"] = result
+        if error is not None:
+            payload["error"] = str(error)
+            payload["error_type"] = error.__class__.__name__
+
+        self.event_pipeline.record_event(event_type, payload, audit=True)
 
 # 2019-04-24T14:55:39 update
 
