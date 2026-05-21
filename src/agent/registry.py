@@ -1,10 +1,11 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+ResolutionCacheKey = Tuple[str, Optional[str], Optional[str]]
 
 
 class AgentStatus(Enum):
@@ -21,8 +22,20 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[ResolutionCacheKey, Dict[str, Any]] = {}
+        self._permission_version = 0
+        self._authorization_audit: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = dict(config or {})
+        config["permissions"] = sorted(
+            self._normalize_permissions(config.get("permissions", []))
+        )
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,7 +43,7 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +53,107 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_resolution_cache(agent_type=agent_type)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def resolve(
+        self,
+        agent_type: str,
+        required_permission: Optional[str] = None,
+        workspace: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an agent without trusting stale authorization decisions."""
+        cache_key = (agent_type, required_permission, workspace)
+        cached = self._resolution_cache.get(cache_key)
+        if cached:
+            agent = self._agents.get(cached["agent_id"])
+            if self._can_resolve(
+                agent,
+                agent_type,
+                required_permission,
+                workspace,
+            ):
+                cached["permission_version"] = self._permission_version
+                self._record_authorization_decision(
+                    "allow",
+                    "cached_resolution_revalidated",
+                    agent_type,
+                    required_permission,
+                    agent["id"],
+                )
+                return agent
+
+            self._resolution_cache.pop(cache_key, None)
+            self._record_authorization_decision(
+                "deny",
+                "cached_resolution_invalidated",
+                agent_type,
+                required_permission,
+                cached.get("agent_id"),
+            )
+
+        for agent in self._agents.values():
+            if self._can_resolve(
+                agent,
+                agent_type,
+                required_permission,
+                workspace,
+            ):
+                self._resolution_cache[cache_key] = {
+                    "agent_id": agent["id"],
+                    "permission_version": self._permission_version,
+                }
+                self._record_authorization_decision(
+                    "allow",
+                    "fresh_resolution",
+                    agent_type,
+                    required_permission,
+                    agent["id"],
+                )
+                return agent
+
+        self._record_authorization_decision(
+            "deny",
+            "no_authorized_agent",
+            agent_type,
+            required_permission,
+        )
+        return None
+
+    def update_permissions(
+        self,
+        agent_id: str,
+        permissions: List[str],
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+
+        self._agents[agent_id]["config"]["permissions"] = sorted(
+            self._normalize_permissions(permissions)
+        )
+        self._agents[agent_id]["updated_at"] = time.time()
+        self._permission_version += 1
+        self._invalidate_resolution_cache(agent_id=agent_id)
+        self._record_authorization_decision(
+            "defer",
+            "permissions_changed_cache_invalidated",
+            self._agents[agent_id]["type"],
+            None,
+            agent_id,
+        )
+        return True
+
+    def authorization_decisions(self) -> List[Dict[str, Any]]:
+        return [dict(decision) for decision in self._authorization_audit]
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +167,7 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache(agent_id=agent_id)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +177,90 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_resolution_cache(agent_id=agent_id)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def _can_resolve(
+        self,
+        agent: Optional[Dict[str, Any]],
+        agent_type: str,
+        required_permission: Optional[str],
+        workspace: Optional[str],
+    ) -> bool:
+        if not agent or agent["type"] != agent_type:
+            return False
+        if agent["status"] in {
+            AgentStatus.STOPPED.value,
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }:
+            return False
+
+        config = agent.get("config", {})
+        if workspace is not None and config.get("workspace") != workspace:
+            return False
+        if required_permission is None:
+            return True
+
+        permissions = self._normalize_permissions(
+            config.get("permissions", [])
+        )
+        return required_permission in permissions
+
+    def _invalidate_resolution_cache(
+        self,
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+    ) -> None:
+        if agent_id is None and agent_type is None:
+            self._resolution_cache.clear()
+            return
+
+        stale_keys = [
+            key
+            for key, cached in self._resolution_cache.items()
+            if cached["agent_id"] == agent_id or key[0] == agent_type
+        ]
+        for key in stale_keys:
+            self._resolution_cache.pop(key, None)
+
+    def _normalize_permissions(self, permissions: Any) -> Set[str]:
+        if permissions is None:
+            return set()
+        if not isinstance(permissions, (list, tuple, set)):
+            raise ValueError(
+                "permissions must be a list of non-empty strings"
+            )
+
+        normalized: Set[str] = set()
+        for permission in permissions:
+            if not isinstance(permission, str) or not permission.strip():
+                raise ValueError(
+                    "permissions must be a list of non-empty strings"
+                )
+            normalized.add(permission.strip())
+        return normalized
+
+    def _record_authorization_decision(
+        self,
+        decision: str,
+        reason: str,
+        agent_type: str,
+        required_permission: Optional[str],
+        agent_id: Optional[str] = None,
+    ) -> None:
+        self._authorization_audit.append({
+            "decision": decision,
+            "reason": reason,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "required_permission": required_permission,
+            "permission_version": self._permission_version,
+            "timestamp": time.time(),
+        })
 
 # 2019-01-29T11:24:49 update
 

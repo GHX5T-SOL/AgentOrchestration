@@ -48,6 +48,82 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_cached_resolution_rechecks_permission_changes(self):
+        agent_id = self.registry.register(
+            "payments-worker",
+            "worker.processor",
+            {"permissions": ["tasks:run"], "workspace": "alpha"},
+        )
+
+        resolved = self.registry.resolve(
+            "worker.processor",
+            required_permission="tasks:run",
+            workspace="alpha",
+        )
+        assert resolved["id"] == agent_id
+
+        assert self.registry.update_permissions(agent_id, ["tasks:read"])
+
+        assert self.registry.resolve(
+            "worker.processor",
+            required_permission="tasks:run",
+            workspace="alpha",
+        ) is None
+        decisions = self.registry.authorization_decisions()
+        assert any(
+            decision["reason"] == "permissions_changed_cache_invalidated"
+            for decision in decisions
+        )
+        assert decisions[-1]["reason"] == "no_authorized_agent"
+
+    def test_resolution_cache_revalidates_agent_lifecycle_state(self):
+        agent_id = self.registry.register(
+            "payments-worker",
+            "worker.processor",
+            {"permissions": ["tasks:run"]},
+        )
+        assert self.registry.resolve(
+            "worker.processor",
+            required_permission="tasks:run",
+        )["id"] == agent_id
+
+        assert self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+
+        assert self.registry.resolve(
+            "worker.processor",
+            required_permission="tasks:run",
+        ) is None
+
+    def test_resolution_audit_excludes_private_runtime_config(self):
+        self.registry.register(
+            "payments-worker",
+            "worker.processor",
+            {
+                "permissions": ["tasks:run"],
+                "workspace": "alpha",
+                "token": "secret-token",
+            },
+        )
+
+        self.registry.resolve(
+            "worker.processor",
+            required_permission="tasks:run",
+            workspace="alpha",
+        )
+
+        decisions = self.registry.authorization_decisions()
+        assert decisions
+        assert "secret-token" not in repr(decisions)
+        assert all("config" not in decision for decision in decisions)
+
+    def test_registration_rejects_invalid_permission_shape(self):
+        with pytest.raises(ValueError):
+            self.registry.register(
+                "payments-worker",
+                "worker.processor",
+                {"permissions": ["tasks:run", ""]},
+            )
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
