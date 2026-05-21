@@ -3,29 +3,65 @@
 import argparse
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
+from src.deploy import (
+    ManifestValidationError,
+    dry_run_manifest,
+    format_diff,
+    load_manifest,
+)
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate without deploying",
+    )
+    deploy_parser.add_argument(
+        "--previous",
+        help="Previous manifest for dry-run diff",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
     args = parser.parse_args()
 
@@ -37,6 +73,22 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
+        if args.dry_run:
+            try:
+                manifest = load_manifest(args.manifest)
+                previous_manifest = (
+                    load_manifest(args.previous) if args.previous else {}
+                )
+                preview = dry_run_manifest(manifest, previous_manifest)
+            except ManifestValidationError as exc:
+                print(f"Manifest validation failed: {exc}", file=sys.stderr)
+                return 1
+
+            print("Dry-run manifest validation passed.")
+            diff_output = format_diff(preview["diff"])
+            if diff_output:
+                print(diff_output)
+            return 0
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
         print("Checking agent status...")
@@ -44,11 +96,13 @@ def cli():
         print(f"Fetching logs for agent: {args.agent_id}")
     else:
         parser.print_help()
-        sys.exit(1)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
 
 # 2019-01-03T18:44:00 update
 
