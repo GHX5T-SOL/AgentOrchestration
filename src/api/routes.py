@@ -1,32 +1,81 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Header, HTTPException, Request, Response
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.agent.registry import (
+    AgentConfigPreconditionRequired,
+    InvalidAgentConfigUpdate,
+    StaleAgentConfigUpdate,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
 
 @router.get("/agents/{agent_id}")
-async def get_agent(agent_id: str):
+async def get_agent(agent_id: str, response: Response):
     agent = registry.get(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    response.headers["ETag"] = registry.get_config_etag(agent_id)
     return agent
+
+
+@router.put("/agents/{agent_id}/config")
+async def update_agent_config(
+    agent_id: str,
+    request: Request,
+    response: Response,
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed JSON body",
+        ) from exc
+
+    if isinstance(body, dict) and "config" in body:
+        config = body["config"]
+    else:
+        config = body
+
+    try:
+        agent = registry.update_config(agent_id, config, if_match)
+    except AgentConfigPreconditionRequired as exc:
+        raise HTTPException(status_code=428, detail=str(exc)) from exc
+    except InvalidAgentConfigUpdate as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except StaleAgentConfigUpdate as exc:
+        raise HTTPException(status_code=412, detail=str(exc)) from exc
+
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    response.headers["ETag"] = registry.get_config_etag(agent_id)
+    return {"agent_id": agent_id, "config": agent["config"]}
 
 
 @router.delete("/agents/{agent_id}")

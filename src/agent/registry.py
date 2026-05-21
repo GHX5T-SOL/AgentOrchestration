@@ -1,6 +1,6 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import copy
 import time
 import uuid
 from enum import Enum
@@ -16,13 +16,30 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class AgentConfigPreconditionRequired(ValueError):
+    """Raised when an optimistic config update omits its current ETag."""
+
+
+class InvalidAgentConfigUpdate(ValueError):
+    """Raised when an optimistic config update request is malformed."""
+
+
+class StaleAgentConfigUpdate(ValueError):
+    """Raised when an optimistic config update uses an old ETag."""
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,7 +47,9 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": copy.deepcopy(config or {}),
+            "config_revision": 1,
+            "config_etag": self._format_config_etag(1),
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -45,7 +64,65 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_config_etag(self, agent_id: str) -> Optional[str]:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+        return agent["config_etag"]
+
+    def update_config(
+        self,
+        agent_id: str,
+        config: Any,
+        if_match: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        self._validate_config_update(config, if_match)
+
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+
+        if if_match != agent["config_etag"]:
+            raise StaleAgentConfigUpdate("Agent config has changed")
+
+        agent["config"] = copy.deepcopy(config)
+        agent["config_revision"] += 1
+        agent["config_etag"] = self._format_config_etag(
+            agent["config_revision"]
+        )
+        agent["updated_at"] = time.time()
+        return agent
+
+    @staticmethod
+    def _format_config_etag(revision: int) -> str:
+        return f'"config-{revision}"'
+
+    @staticmethod
+    def _validate_config_update(config: Any, if_match: Optional[str]) -> None:
+        if if_match is None or if_match.strip() == "":
+            raise AgentConfigPreconditionRequired(
+                "If-Match header is required"
+            )
+        if not AgentRegistry._is_strong_etag(if_match):
+            raise InvalidAgentConfigUpdate("If-Match must be a strong ETag")
+        if not isinstance(config, dict):
+            raise InvalidAgentConfigUpdate("Config body must be an object")
+
+    @staticmethod
+    def _is_strong_etag(value: str) -> bool:
+        value = value.strip()
+        return (
+            len(value) > 2
+            and value.startswith('"')
+            and value.endswith('"')
+            and not value.startswith("W/")
+        )
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
