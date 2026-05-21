@@ -1,5 +1,6 @@
 """API middleware components."""
 
+import os
 import time
 import logging
 from typing import Callable
@@ -7,16 +8,85 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .auth import AuthError, AuthPolicy
+from src.common.metrics import metrics
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+    def __init__(self, app):
+        super().__init__(app)
+        self.policy = AuthPolicy(
+            audience=os.getenv("AO_AUTH_AUDIENCE", "agent-workers"),
+            required_scope=os.getenv("AO_REQUIRED_SCOPE", "agent:worker"),
+            signing_secret=os.getenv("AO_JWT_SECRET", ""),
+            issuer=os.getenv("AO_JWT_ISSUER", ""),
+            allowed_roles=self._split_env(
+                os.getenv("AO_ALLOWED_ROLES", "admin,operator,worker")
+            ),
+            revoked_token_ids=self._split_env(
+                os.getenv("AO_REVOKED_JTIS", "")
+            ),
+        )
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        protected_api = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if protected_api:
+            token = self._extract_token(request)
+            if not token:
+                self._record_auth_denied("missing_token", 401)
+                return self._auth_response(401, "Unauthorized")
+            try:
+                principal = self.policy.authenticate(token)
+                request.state.auth_principal = principal
+                request.state.auth_subject = principal.subject
+            except AuthError as exc:
+                self._record_auth_denied(exc.reason, exc.status_code)
+                return self._auth_response(exc.status_code, str(exc))
+
+        try:
+            response = await call_next(request)
+            if protected_api:
+                metrics.increment("auth.accepted")
+                response.headers["X-Auth-Decision"] = "accepted"
+            return response
+        finally:
+            for attr in ("auth_principal", "auth_subject"):
+                if hasattr(request.state, attr):
+                    delattr(request.state, attr)
+
+    @staticmethod
+    def _split_env(value: str) -> set:
+        return {part.strip() for part in value.split(",") if part.strip()}
+
+    @staticmethod
+    def _extract_token(request: Request) -> str:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            return authorization[len("Bearer "):].strip()
+        return request.cookies.get("ao_session", "").strip()
+
+    @staticmethod
+    def _record_auth_denied(reason: str, status_code: int) -> None:
+        metrics.increment("auth.denied")
+        metrics.increment(f"auth.denied.{status_code}")
+        metrics.increment(f"auth.denied.{reason}")
+
+    @staticmethod
+    def _auth_response(status_code: int, message: str) -> Response:
+        return Response(
+            status_code=status_code,
+            content=message,
+            headers={"X-Auth-Decision": "denied"},
+        )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +96,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +120,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
