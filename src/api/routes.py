@@ -1,22 +1,36 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, Optional
+
+from fastapi import APIRouter, HTTPException, Request
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.artifacts import (
+    ArtifactIngestionService,
+    ArtifactTooLargeError,
+    ArtifactValidationError,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+artifact_service = ArtifactIngestionService()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +67,46 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/runs/{run_id}/artifacts/{artifact_name}")
+async def upload_artifact(
+    run_id: str,
+    artifact_name: str,
+    request: Request,
+):
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid content-length",
+            )
+        if declared_size > artifact_service.max_body_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="artifact body exceeds max size",
+            )
+
+    body = await request.body()
+    try:
+        artifact = artifact_service.ingest(
+            run_id,
+            artifact_name,
+            body,
+            request.headers.get(
+                "content-type",
+                "application/octet-stream",
+            ),
+        )
+    except ArtifactTooLargeError as error:
+        raise HTTPException(status_code=413, detail=str(error))
+    except ArtifactValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    return {"status": "accepted", "artifact": artifact}
 
 # 2019-03-18T11:10:18 update
 
