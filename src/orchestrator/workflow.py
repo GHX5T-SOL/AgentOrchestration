@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -13,13 +13,29 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowValidationError(ValueError):
+    pass
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        branch: Optional[str] = None,
+        output_namespace: Optional[str] = None,
+        join_inputs: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.branch = branch
+        self.output_namespace = output_namespace
+        self.join_inputs = join_inputs or []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -32,20 +48,71 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self._namespaces: Dict[str, str] = {}
+        self.outputs: Dict[str, Any] = {}
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        self._validate_step_registration(step)
         self.steps.append(step)
         self._step_map[step.id] = step
+        if step.output_namespace:
+            self._namespaces[step.output_namespace] = step.id
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
+    def validate(self) -> None:
+        available_namespaces = set(self._namespaces)
+        for step in self.steps:
+            self._validate_join_inputs(step, available_namespaces)
+
+    def _validate_step_registration(self, step: WorkflowStep) -> None:
+        if step.branch and not step.output_namespace:
+            raise WorkflowValidationError(
+                "parallel branch steps must declare an output namespace"
+            )
+        if step.output_namespace:
+            namespace = self._normalize_namespace(step.output_namespace)
+            if namespace in self._namespaces:
+                raise WorkflowValidationError(
+                    f"duplicate workflow output namespace: {namespace}"
+                )
+            step.output_namespace = namespace
+
+        self._validate_join_inputs(step, set(self._namespaces))
+
+    def _validate_join_inputs(
+        self,
+        step: WorkflowStep,
+        available_namespaces: Set[str],
+    ) -> None:
+        seen: Set[str] = set()
+        for namespace in step.join_inputs:
+            normalized = self._normalize_namespace(namespace)
+            if normalized in seen:
+                raise WorkflowValidationError(
+                    f"duplicate join namespace: {normalized}"
+                )
+            if normalized not in available_namespaces:
+                raise WorkflowValidationError(
+                    f"join references unknown namespace: {normalized}"
+                )
+            seen.add(normalized)
+
+    def _normalize_namespace(self, namespace: str) -> str:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise WorkflowValidationError(
+                "workflow output namespace must be a non-empty string"
+            )
+        return namespace.strip()
+
 
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._validation_audit: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -58,6 +125,9 @@ class WorkflowManager:
     def list_workflows(self) -> List[Workflow]:
         return list(self._workflows.values())
 
+    def validation_decisions(self) -> List[Dict[str, Any]]:
+        return [dict(decision) for decision in self._validation_audit]
+
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
@@ -66,21 +136,58 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        try:
+            workflow.validate()
+        except WorkflowValidationError as error:
+            self._record_validation_decision(
+                workflow_id,
+                "deny",
+                str(error),
+            )
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
                 step.result = result
+                if step.output_namespace:
+                    workflow.outputs[step.output_namespace] = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
+                self._record_validation_decision(
+                    workflow_id,
+                    "defer",
+                    "handler_failed",
+                    step.name,
+                )
                 return False
 
         workflow.status = StepStatus.COMPLETED
+        self._record_validation_decision(
+            workflow_id,
+            "allow",
+            "workflow_outputs_namespaced",
+        )
         return True
+
+    def _record_validation_decision(
+        self,
+        workflow_id: str,
+        decision: str,
+        reason: str,
+        step_name: Optional[str] = None,
+    ) -> None:
+        self._validation_audit.append({
+            "workflow_id": workflow_id,
+            "decision": decision,
+            "reason": reason,
+            "step_name": step_name,
+        })
 
 # 2019-03-27T19:58:07 update
 
