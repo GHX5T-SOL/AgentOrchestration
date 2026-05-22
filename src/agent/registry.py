@@ -1,10 +1,14 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -16,13 +20,31 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class DuplicateCapabilityError(ValueError):
+    """Raised when a plugin attempts to claim an existing capability name."""
+
+
 class AgentRegistry:
-    def __init__(self, storage_backend: str = "memory"):
+    def __init__(
+        self,
+        storage_backend: str = "memory",
+        metrics_collector=metrics,
+    ):
         self.storage_backend = storage_backend
+        self._metrics = metrics_collector
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._plugins: Dict[str, Dict[str, Any]] = {}
+        self._capability_index: Dict[str, str] = {}
+        self._resolution_cache: Dict[str, str] = {}
+        self._plugin_decisions: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -45,7 +67,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -72,6 +98,216 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    def register_plugin(
+        self,
+        name: str,
+        capabilities: List[str],
+        metadata: Optional[Dict[str, Any]] = None,
+        replace: bool = False,
+    ) -> str:
+        plugin_name = self._normalize_plugin_name(name)
+        normalized_capabilities = self._normalize_capabilities(capabilities)
+
+        if plugin_name in self._plugins and not replace:
+            self._reject_plugin_registration(
+                plugin_name,
+                normalized_capabilities,
+                reason="plugin_already_registered",
+                conflicts={plugin_name: normalized_capabilities},
+            )
+
+        conflicts = self._find_capability_conflicts(
+            plugin_name,
+            normalized_capabilities,
+            replace=replace,
+        )
+        if conflicts:
+            self._reject_plugin_registration(
+                plugin_name,
+                normalized_capabilities,
+                reason="duplicate_capability",
+                conflicts=conflicts,
+            )
+
+        previous_capabilities = set(
+            self._plugins.get(plugin_name, {}).get("capabilities", [])
+        )
+        changed_capabilities = (
+            previous_capabilities | set(normalized_capabilities)
+        )
+
+        for capability in previous_capabilities:
+            self._capability_index.pop(capability, None)
+
+        self._plugins[plugin_name] = {
+            "name": plugin_name,
+            "capabilities": list(normalized_capabilities),
+            "metadata": dict(metadata or {}),
+            "registered_at": time.time(),
+        }
+        for capability in normalized_capabilities:
+            self._capability_index[capability] = plugin_name
+
+        self._invalidate_resolution_cache(changed_capabilities)
+        self._record_plugin_decision(
+            "accepted",
+            plugin_name,
+            normalized_capabilities,
+            reason="registered",
+        )
+        self._metrics.increment("registry.plugin_registration.accepted")
+        logger.info(
+            "plugin registration accepted",
+            extra={
+                "plugin": plugin_name,
+                "capability_count": len(normalized_capabilities),
+            },
+        )
+        return plugin_name
+
+    def unregister_plugin(self, name: str) -> bool:
+        plugin_name = self._normalize_plugin_name(name)
+        plugin = self._plugins.pop(plugin_name, None)
+        if not plugin:
+            return False
+
+        capabilities = set(plugin["capabilities"])
+        for capability in capabilities:
+            self._capability_index.pop(capability, None)
+        self._invalidate_resolution_cache(capabilities)
+        self._record_plugin_decision(
+            "accepted",
+            plugin_name,
+            list(capabilities),
+            reason="unregistered",
+        )
+        self._metrics.increment("registry.plugin_registration.unregistered")
+        return True
+
+    def resolve_capability(self, capability: str) -> Optional[Dict[str, Any]]:
+        normalized_capability = self._normalize_capability(capability)
+        cached_plugin = self._resolution_cache.get(normalized_capability)
+        plugin_name = (
+            cached_plugin or
+            self._capability_index.get(normalized_capability)
+        )
+        if not plugin_name:
+            self._metrics.increment("registry.capability_resolution.miss")
+            return None
+
+        self._resolution_cache[normalized_capability] = plugin_name
+        self._metrics.increment("registry.capability_resolution.hit")
+        return self._copy_plugin(self._plugins[plugin_name])
+
+    def plugin_decisions(self) -> List[Dict[str, Any]]:
+        return [dict(decision) for decision in self._plugin_decisions]
+
+    def _normalize_plugin_name(self, name: str) -> str:
+        plugin_name = name.strip()
+        if not plugin_name:
+            raise ValueError("plugin name must not be empty")
+        return plugin_name
+
+    def _normalize_capabilities(self, capabilities: List[str]) -> List[str]:
+        normalized = [
+            self._normalize_capability(capability)
+            for capability in capabilities
+        ]
+        if not normalized:
+            raise ValueError("plugin must declare at least one capability")
+
+        duplicates = sorted({
+            capability for capability in normalized
+            if normalized.count(capability) > 1
+        })
+        if duplicates:
+            self._reject_plugin_registration(
+                "<pending>",
+                normalized,
+                reason="duplicate_capability",
+                conflicts={"self": duplicates},
+            )
+        return normalized
+
+    def _normalize_capability(self, capability: str) -> str:
+        normalized = capability.strip().lower()
+        if not normalized:
+            raise ValueError("capability name must not be empty")
+        return normalized
+
+    def _find_capability_conflicts(
+        self,
+        plugin_name: str,
+        capabilities: List[str],
+        replace: bool,
+    ) -> Dict[str, List[str]]:
+        conflicts: Dict[str, List[str]] = {}
+        for capability in capabilities:
+            owner = self._capability_index.get(capability)
+            if owner and (owner != plugin_name or not replace):
+                conflicts.setdefault(owner, []).append(capability)
+        return conflicts
+
+    def _reject_plugin_registration(
+        self,
+        plugin_name: str,
+        capabilities: List[str],
+        reason: str,
+        conflicts: Dict[str, List[str]],
+    ) -> None:
+        sanitized_conflicts = {
+            owner: sorted(capability_names)
+            for owner, capability_names in conflicts.items()
+        }
+        self._record_plugin_decision(
+            "rejected",
+            plugin_name,
+            capabilities,
+            reason=reason,
+            conflicts=sanitized_conflicts,
+        )
+        self._metrics.increment("registry.plugin_registration.rejected")
+        logger.warning(
+            "plugin registration rejected",
+            extra={
+                "plugin": plugin_name,
+                "reason": reason,
+                "conflict_owners": sorted(sanitized_conflicts),
+            },
+        )
+        raise DuplicateCapabilityError(
+            f"plugin {plugin_name!r} rejected: {reason}"
+        )
+
+    def _record_plugin_decision(
+        self,
+        decision: str,
+        plugin_name: str,
+        capabilities: List[str],
+        reason: str,
+        conflicts: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        self._plugin_decisions.append({
+            "decision": decision,
+            "plugin": plugin_name,
+            "capabilities": sorted(capabilities),
+            "reason": reason,
+            "conflicts": conflicts or {},
+            "timestamp": time.time(),
+        })
+
+    def _invalidate_resolution_cache(self, capabilities) -> None:
+        for capability in capabilities:
+            self._resolution_cache.pop(capability, None)
+
+    def _copy_plugin(self, plugin: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "name": plugin["name"],
+            "capabilities": list(plugin["capabilities"]),
+            "metadata": dict(plugin["metadata"]),
+            "registered_at": plugin["registered_at"],
+        }
 
 # 2019-01-29T11:24:49 update
 

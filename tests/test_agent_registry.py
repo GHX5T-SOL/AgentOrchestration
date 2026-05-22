@@ -1,5 +1,9 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import (
+    AgentRegistry,
+    AgentStatus,
+    DuplicateCapabilityError,
+)
 
 
 class TestAgentRegistry:
@@ -47,6 +51,60 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_register_plugin_rejects_duplicate_capability_names(self):
+        self.registry.register_plugin(
+            "safe-router",
+            ["Task.Dispatch", "task.status"],
+            metadata={"secret": "not logged"},
+        )
+        cached_plugin = self.registry.resolve_capability("task.dispatch")
+
+        with pytest.raises(DuplicateCapabilityError):
+            self.registry.register_plugin("stale-router", [" task.dispatch "])
+
+        resolved = self.registry.resolve_capability("task.dispatch")
+        assert resolved == cached_plugin
+        assert resolved["name"] == "safe-router"
+
+        rejected = self.registry.plugin_decisions()[-1]
+        assert rejected["decision"] == "rejected"
+        assert rejected["reason"] == "duplicate_capability"
+        assert rejected["conflicts"] == {"safe-router": ["task.dispatch"]}
+        assert "secret" not in str(rejected)
+
+    def test_register_plugin_rejects_same_plugin_duplicate_capabilities(self):
+        with pytest.raises(DuplicateCapabilityError):
+            self.registry.register_plugin(
+                "bad-router",
+                ["task.dispatch", "TASK.DISPATCH"],
+            )
+
+        assert self.registry.resolve_capability("task.dispatch") is None
+        rejected = self.registry.plugin_decisions()[-1]
+        assert rejected["decision"] == "rejected"
+        assert rejected["conflicts"] == {"self": ["task.dispatch"]}
+
+    def test_replace_plugin_invalidates_affected_resolution_cache(self):
+        self.registry.register_plugin(
+            "router",
+            ["task.dispatch"],
+            metadata={"version": "1"},
+        )
+        first_resolution = self.registry.resolve_capability("task.dispatch")
+        assert first_resolution["metadata"] == {"version": "1"}
+
+        self.registry.register_plugin(
+            "router",
+            ["task.audit"],
+            metadata={"version": "2"},
+            replace=True,
+        )
+
+        assert self.registry.resolve_capability("task.dispatch") is None
+        replacement = self.registry.resolve_capability("task.audit")
+        assert replacement["name"] == "router"
+        assert replacement["metadata"] == {"version": "2"}
 
 # 2019-01-23T10:28:57 update
 
