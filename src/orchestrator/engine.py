@@ -11,12 +11,33 @@ from src.orchestrator.scheduler import TaskScheduler
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_MAX_DELEGATION_DEPTH = 8
+
+
+class DelegationDepthExceeded(Exception):
+    def __init__(self, task_id: Any, depth: int, limit: int) -> None:
+        super().__init__(
+            f"Task {task_id} delegation depth {depth} exceeds limit {limit}"
+        )
+        self.task_id = task_id
+        self.depth = depth
+        self.limit = limit
+
+
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        max_delegation_depth: int = DEFAULT_MAX_DELEGATION_DEPTH,
+    ):
+        if max_delegation_depth < 1:
+            raise ValueError("max_delegation_depth must be >= 1")
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.max_delegation_depth = max_delegation_depth
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -42,6 +63,43 @@ class OrchestrationEngine:
         self._running = False
         logger.info("Orchestration engine stopped")
 
+    def _resolve_delegation_depth(self, task: Dict[str, Any]) -> int:
+        depth = task.get("delegation_depth", 0)
+        if not isinstance(depth, int) or depth < 0:
+            raise ValueError(
+                f"Task {task.get('id')!r} has invalid delegation_depth={depth!r}"
+            )
+        return depth
+
+    def _check_delegation_depth(self, task: Dict[str, Any]) -> None:
+        depth = self._resolve_delegation_depth(task)
+        if depth >= self.max_delegation_depth:
+            raise DelegationDepthExceeded(
+                task.get("id"), depth, self.max_delegation_depth
+            )
+
+    def build_delegated_task(
+        self,
+        parent_task: Dict[str, Any],
+        child_task: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return a child task with delegation_depth set one beyond the parent.
+
+        Raises DelegationDepthExceeded if the resulting depth would exceed
+        ``max_delegation_depth``, so the rejection happens before the child
+        is enqueued, scheduled, or counted against worker capacity.
+        """
+        parent_depth = self._resolve_delegation_depth(parent_task)
+        next_depth = parent_depth + 1
+        if next_depth >= self.max_delegation_depth:
+            raise DelegationDepthExceeded(
+                parent_task.get("id"), next_depth, self.max_delegation_depth
+            )
+        delegated = dict(child_task)
+        delegated["delegation_depth"] = next_depth
+        delegated.setdefault("delegated_from", parent_task.get("id"))
+        return delegated
+
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
         agent_id = task["target_agent"]
@@ -51,6 +109,7 @@ class OrchestrationEngine:
             await hook(task)
 
         try:
+            self._check_delegation_depth(task)
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
