@@ -1,5 +1,9 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import (
+    PriorityQueue,
+    QueueCapacityError,
+    TaskScheduler,
+)
 
 
 class TestTaskScheduler:
@@ -35,6 +39,103 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_fail_restores_in_flight_when_retry_enqueue_rolls_back(
+        self,
+        monkeypatch,
+    ):
+        scheduler = TaskScheduler(queue_capacity=1)
+        scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        def fail_push(item, priority=0):
+            raise RuntimeError("simulated retry enqueue failure")
+
+        monkeypatch.setattr(scheduler._queues["default"], "push", fail_push)
+
+        with pytest.raises(RuntimeError):
+            scheduler.fail(task["id"])
+
+        assert scheduler._in_flight[task["id"]] is task
+        assert task["retries"] == 0
+        assert scheduler.capacity_snapshot()["used"] == 0
+
+    def test_enqueue_releases_capacity_on_rollback(self, monkeypatch):
+        scheduler = TaskScheduler(queue_capacity=1)
+        scheduler._queues["default"] = PriorityQueue()
+
+        def fail_push(item, priority=0):
+            raise RuntimeError("simulated transaction failure")
+
+        monkeypatch.setattr(scheduler._queues["default"], "push", fail_push)
+        task = {"type": "secret", "payload": {"token": "private"}}
+
+        with pytest.raises(RuntimeError):
+            scheduler.enqueue(task, transaction_id="tx-rollback")
+
+        assert scheduler.capacity_snapshot()["used"] == 0
+        assert "id" not in task
+        assert "private" not in str(scheduler.capacity_audit_records())
+
+        scheduler._queues["default"] = PriorityQueue()
+        task_id = scheduler.enqueue(
+            {"type": "retry"},
+            transaction_id="tx-rollback",
+        )
+
+        assert task_id is not None
+        assert scheduler.capacity_snapshot()["used"] == 1
+
+    def test_capacity_limiter_records_sanitized_metrics(self):
+        scheduler = TaskScheduler(queue_capacity=1)
+        scheduler.enqueue({"type": "first"})
+
+        with pytest.raises(QueueCapacityError):
+            scheduler.enqueue({"type": "second", "payload": "private"})
+
+        from src.common.metrics import MetricsCollector
+        metrics = MetricsCollector()
+        limiter = scheduler._capacity
+        limiter._metrics = metrics
+        limiter.release(
+            next(iter(limiter._reservations)),
+            "test_release",
+        )
+
+        snapshot = metrics.snapshot()
+        assert snapshot["counters"]["queue.capacity.accepted"] == 1
+        assert snapshot["counters"]["queue.capacity.reason.test_release"] == 1
+        assert "private" not in str(scheduler.capacity_audit_records())
+
+    def test_enqueue_capacity_limit_rejects_without_mutating_task(self):
+        scheduler = TaskScheduler(queue_capacity=1)
+        scheduler.enqueue({"type": "first"})
+        second = {"type": "second"}
+
+        with pytest.raises(QueueCapacityError):
+            scheduler.enqueue(second)
+
+        assert "id" not in second
+        assert scheduler.capacity_snapshot()["used"] == 1
+
+    def test_enqueue_transaction_id_is_idempotent(self):
+        scheduler = TaskScheduler(queue_capacity=2)
+
+        first = scheduler.enqueue({"type": "first"}, transaction_id="tx-once")
+        second = scheduler.enqueue(
+            {"type": "second"},
+            transaction_id="tx-once",
+        )
+
+        assert second == first
+        assert scheduler.capacity_snapshot()["used"] == 1
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert task["type"] == "first"
+        assert scheduler.capacity_snapshot()["used"] == 0
 
 # 2019-01-09T19:07:03 update
 
