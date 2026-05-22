@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,92 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_urgent_budget_defers_duplicate_lane_transition(self):
+        scheduler = TaskScheduler(fairness_budgets={"urgent": 1})
+        scheduler.enqueue(
+            {"type": "workflow", "name": "first"},
+            priority=100,
+            priority_class="urgent",
+        )
+        scheduler.enqueue(
+            {"type": "workflow", "name": "second"},
+            priority=90,
+            priority_class="urgent",
+        )
+
+        import asyncio
+        first = asyncio.run(scheduler.dequeue())
+        blocked = asyncio.run(scheduler.dequeue())
+
+        assert first["name"] == "first"
+        assert blocked is None
+        assert scheduler.audit_events()[-1]["decision"] == "deferred"
+        assert scheduler.audit_events()[-1]["reason"] == "budget_exhausted"
+
+        assert scheduler.complete(first["id"])
+        second = asyncio.run(scheduler.dequeue())
+        assert second["name"] == "second"
+
+    def test_priority_class_budgets_are_separate(self):
+        scheduler = TaskScheduler(
+            fairness_budgets={
+                "urgent": 1,
+                "normal": 1,
+            },
+        )
+        scheduler.enqueue(
+            {"type": "workflow", "name": "urgent-a"},
+            priority=100,
+            priority_class="urgent",
+        )
+        scheduler.enqueue(
+            {"type": "workflow", "name": "urgent-b"},
+            priority=90,
+            priority_class="urgent",
+        )
+        scheduler.enqueue(
+            {"type": "workflow", "name": "normal"},
+            priority=10,
+            priority_class="normal",
+        )
+
+        import asyncio
+        urgent = asyncio.run(scheduler.dequeue())
+        normal = asyncio.run(scheduler.dequeue())
+
+        assert urgent["name"] == "urgent-a"
+        assert normal["name"] == "normal"
+        assert normal["priority_class"] == "normal"
+        assert scheduler.metrics_snapshot()["scheduler.accepted.urgent"] == 1
+        assert scheduler.metrics_snapshot()["scheduler.accepted.normal"] == 1
+
+    def test_scheduled_urgent_task_preserves_budget_state(self):
+        scheduler = TaskScheduler(fairness_budgets={"urgent": 1})
+        scheduler.enqueue(
+            {"type": "workflow", "name": "running"},
+            priority=100,
+            priority_class="urgent",
+        )
+        scheduler.schedule(
+            {"type": "workflow", "name": "scheduled"},
+            delay=0,
+            priority=100,
+            priority_class="urgent",
+        )
+
+        import asyncio
+        running = asyncio.run(scheduler.dequeue())
+        blocked = asyncio.run(scheduler.dequeue())
+
+        assert running["name"] == "running"
+        assert blocked is None
+        assert scheduler.audit_events()[-1]["decision"] == "deferred"
+
+        assert scheduler.complete(running["id"])
+        scheduled = asyncio.run(scheduler.dequeue())
+        assert scheduled["name"] == "scheduled"
+        assert scheduled["priority_class"] == "urgent"
 
 # 2019-01-09T19:07:03 update
 
