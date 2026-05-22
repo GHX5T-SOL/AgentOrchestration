@@ -31,6 +31,28 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_reset_clears_collector_state(self):
+        self.metrics.increment("requests.total", 3)
+        self.metrics.gauge("memory.usage", 42.0)
+        self.metrics.observe("response.time", 1.0)
+        self.metrics.start_timer("operation")
+
+        self.metrics.reset()
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"] == {}
+        assert snapshot["gauges"] == {}
+        assert snapshot["histograms"] == {}
+
+    def test_module_collector_reset_isolates_runs(self):
+        from src.common import metrics as metrics_module
+
+        metrics_module.metrics.increment("run.total")
+        metrics_module.metrics.reset()
+
+        snapshot = metrics_module.metrics.snapshot()
+        assert snapshot["counters"] == {}
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update
