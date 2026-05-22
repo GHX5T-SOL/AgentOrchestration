@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.services import ApiValidationError, validate_agent_registration
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -17,6 +18,13 @@ async def list_agents(status: Optional[str] = None, group: Optional[str] = None)
 
 @router.post("/agents")
 async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+    try:
+        validate_agent_registration(name, agent_type)
+    except ApiValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": exc.code, "message": exc.message},
+        )
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
