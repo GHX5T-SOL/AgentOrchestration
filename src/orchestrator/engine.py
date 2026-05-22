@@ -1,20 +1,320 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.metrics import metrics as default_metrics
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EventRule:
+    resource_kind: str
+    allowed_from: tuple
+    next_lifecycle: str
+
+
+@dataclass
+class EventResourceState:
+    lifecycle: str = "pending"
+    attempt: int = 0
+    revision: int = 0
+    seen_events: set = field(default_factory=set)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "lifecycle": self.lifecycle,
+            "attempt": self.attempt,
+            "revision": self.revision,
+        }
+
+
+@dataclass(frozen=True)
+class DispatchDecision:
+    accepted: bool
+    reason: str
+    event_type: str
+    resource_kind: str
+
+
+class EventDispatcher:
+    """Validates rolling-upgrade events before lifecycle state is committed."""
+
+    DEFAULT_RULES: Dict[str, EventRule] = {
+        "run.started": EventRule(
+            "run",
+            ("pending", "queued", "failed"),
+            "running",
+        ),
+        "run.completed": EventRule("run", ("running",), "completed"),
+        "run.failed": EventRule(
+            "run",
+            ("pending", "queued", "running"),
+            "failed",
+        ),
+        "task.queued": EventRule("task", ("pending",), "queued"),
+        "task.started": EventRule("task", ("queued",), "running"),
+        "task.completed": EventRule("task", ("running",), "completed"),
+        "task.failed": EventRule("task", ("queued", "running"), "failed"),
+        "handler.registered": EventRule(
+            "handler",
+            ("pending", "removed"),
+            "registered",
+        ),
+        "handler.draining": EventRule("handler", ("registered",), "draining"),
+        "handler.removed": EventRule(
+            "handler",
+            ("registered", "draining"),
+            "removed",
+        ),
+    }
+
+    def __init__(
+        self,
+        rules: Optional[Dict[str, EventRule]] = None,
+        audit_logger: Optional[logging.Logger] = None,
+        metrics_collector: Optional[Any] = None,
+    ):
+        self._rules = rules or self.DEFAULT_RULES
+        self._states: Dict[tuple, EventResourceState] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._quarantined_records: List[Dict[str, Any]] = []
+        self._logger = audit_logger or logger
+        self._metrics = metrics_collector or default_metrics
+
+    def dispatch(self, event: Dict[str, Any]) -> DispatchDecision:
+        event_type = str(event.get("type") or "")
+        rule = self._rules.get(event_type)
+        if rule is None:
+            return self._quarantine(
+                event_type=event_type or "missing",
+                resource_kind="unknown",
+                reason="unknown_event_type",
+            )
+
+        attempt = self._non_negative_int(event.get("attempt", 0))
+        revision = self._non_negative_int(event.get("revision", 0))
+        if attempt is None:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "invalid_attempt",
+            )
+        if revision is None:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "invalid_revision",
+            )
+
+        resource_id = self._resource_id(event, rule.resource_kind)
+        if not resource_id:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "missing_resource",
+            )
+        entity_ref = self._entity_ref(rule.resource_kind, resource_id)
+
+        expected_lifecycle = event.get("lifecycle")
+        if expected_lifecycle and expected_lifecycle != rule.next_lifecycle:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "lifecycle_mismatch",
+                attempt,
+                revision,
+                entity_ref,
+            )
+
+        key = (rule.resource_kind, resource_id)
+        state = self._states.get(key, EventResourceState())
+        event_signature = self._event_signature(event, rule, attempt, revision)
+
+        if event_signature in state.seen_events:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "duplicate_event",
+                attempt,
+                revision,
+                entity_ref,
+            )
+        if attempt < state.attempt:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "stale_attempt",
+                attempt,
+                revision,
+                entity_ref,
+            )
+        if attempt == state.attempt and revision < state.revision:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "stale_revision",
+                attempt,
+                revision,
+                entity_ref,
+            )
+
+        lifecycle = state.lifecycle
+        if attempt > state.attempt and "pending" in rule.allowed_from:
+            lifecycle = "pending"
+        if lifecycle not in rule.allowed_from:
+            return self._quarantine(
+                event_type,
+                rule.resource_kind,
+                "invalid_lifecycle_transition",
+                attempt,
+                revision,
+                entity_ref,
+            )
+
+        state.lifecycle = rule.next_lifecycle
+        state.attempt = attempt
+        state.revision = revision
+        state.seen_events.add(event_signature)
+        self._states[key] = state
+        return self._record(
+            accepted=True,
+            event_type=event_type,
+            resource_kind=rule.resource_kind,
+            reason="accepted",
+            attempt=attempt,
+            revision=revision,
+            entity_ref=entity_ref,
+        )
+
+    def get_state(
+        self,
+        resource_kind: str,
+        resource_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        state = self._states.get((resource_kind, resource_id))
+        return state.snapshot() if state else None
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
+
+    def quarantined_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._quarantined_records]
+
+    @staticmethod
+    def _resource_id(
+        event: Dict[str, Any],
+        resource_kind: str,
+    ) -> Optional[str]:
+        for field_name in (f"{resource_kind}_id", "resource_id", "id"):
+            value = event.get(field_name)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _non_negative_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    @staticmethod
+    def _event_signature(
+        event: Dict[str, Any],
+        rule: EventRule,
+        attempt: int,
+        revision: int,
+    ) -> str:
+        explicit_id = event.get("event_id")
+        if explicit_id:
+            return str(explicit_id)
+        return (
+            f"{rule.resource_kind}:"
+            f"{attempt}:"
+            f"{revision}:"
+            f"{rule.next_lifecycle}"
+        )
+
+    @staticmethod
+    def _entity_ref(resource_kind: str, resource_id: str) -> str:
+        digest = hashlib.sha256(
+            f"{resource_kind}:{resource_id}".encode("utf-8")
+        ).hexdigest()
+        return f"{resource_kind}:{digest[:12]}"
+
+    def _quarantine(
+        self,
+        event_type: str,
+        resource_kind: str,
+        reason: str,
+        attempt: Optional[int] = None,
+        revision: Optional[int] = None,
+        entity_ref: Optional[str] = None,
+    ) -> DispatchDecision:
+        decision = self._record(
+            accepted=False,
+            event_type=event_type,
+            resource_kind=resource_kind,
+            reason=reason,
+            attempt=attempt,
+            revision=revision,
+            entity_ref=entity_ref,
+        )
+        self._quarantined_records.append(self._audit_records[-1])
+        return decision
+
+    def _record(
+        self,
+        accepted: bool,
+        event_type: str,
+        resource_kind: str,
+        reason: str,
+        attempt: Optional[int] = None,
+        revision: Optional[int] = None,
+        entity_ref: Optional[str] = None,
+    ) -> DispatchDecision:
+        record = {
+            "accepted": accepted,
+            "event_type": event_type,
+            "resource_kind": resource_kind,
+            "reason": reason,
+        }
+        if attempt is not None:
+            record["attempt"] = attempt
+        if revision is not None:
+            record["revision"] = revision
+        if entity_ref is not None:
+            record["entity_ref"] = entity_ref
+
+        self._audit_records.append(record)
+        if self._metrics:
+            outcome = "accepted" if accepted else "quarantined"
+            self._metrics.increment(f"orchestrator.events.{outcome}")
+            self._metrics.increment(f"orchestrator.events.reason.{reason}")
+        log_method = self._logger.info if accepted else self._logger.warning
+        log_method(
+            "orchestrator event dispatch decision",
+            extra={"decision": record},
+        )
+        return DispatchDecision(accepted, reason, event_type, resource_kind)
 
 
 class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.event_dispatcher = EventDispatcher()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -28,6 +328,9 @@ class OrchestrationEngine:
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def dispatch_event(self, event: Dict[str, Any]) -> DispatchDecision:
+        return self.event_dispatcher.dispatch(event)
 
     async def start(self) -> None:
         self._running = True
@@ -82,7 +385,12 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": (
+                f"Task {task['id']} processed by {agent['name']}"
+            ),
+        }
 
 # 2019-04-24T14:55:39 update
 
