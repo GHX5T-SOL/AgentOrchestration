@@ -1,22 +1,38 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Header, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.run_details import (
+    RunDetailAuthorizationError,
+    RunDetailNotFoundError,
+    RunDetailResponse,
+    RunDetailService,
+    RunDetailValidationError,
+    request_has_admin_run_scope,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+run_detail_service = RunDetailService()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +69,32 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunDetailResponse,
+    response_model_exclude_none=True,
+)
+async def get_run_detail(
+    run_id: str,
+    include_admin: bool = False,
+    x_admin: Optional[str] = Header(default=None, alias="X-Admin"),
+    x_user_scopes: Optional[str] = Header(default=None, alias="X-User-Scopes"),
+):
+    requester_is_admin = request_has_admin_run_scope(x_admin, x_user_scopes)
+    try:
+        return run_detail_service.get_run_detail_response(
+            run_id,
+            include_admin_fields=include_admin,
+            requester_is_admin=requester_is_admin,
+        )
+    except RunDetailValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RunDetailAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RunDetailNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
 
 # 2019-03-18T11:10:18 update
 
