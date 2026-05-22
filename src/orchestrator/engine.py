@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.exception_tracking import build_exception_event
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -68,9 +69,15 @@ class OrchestrationEngine:
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
-            logger.error(f"Task {task_id} failed: {e}")
+            exception_event = build_exception_event(task, e, locals())
+            logger.error(
+                "Task %s failed with %s",
+                exception_event.get("task_id", "unknown"),
+                exception_event["error_class"],
+                extra={"exception_context": exception_event},
+            )
             for hook in self._hooks["on_error"]:
-                await hook(task, e)
+                await hook(dict(exception_event), e)
 
     async def _run_agent_task(self, agent: Dict, task: Dict) -> Any:
         loop = asyncio.get_event_loop()
@@ -82,7 +89,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
